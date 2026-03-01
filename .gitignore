@@ -29,6 +29,8 @@ htmlcov/
 # Runtime data/cache
 flights_cache.db
 flights_cache.db-journal
+flights_cache.db-shm
+flights_cache.db-wal
 
 # Local run outputs
 debug_run.log

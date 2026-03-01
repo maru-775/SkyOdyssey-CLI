@@ -3,6 +3,7 @@ import json
 import datetime
 import sys
 import re
+import atexit
 from urllib.parse import urlencode
 from typing import Any, Optional, Dict, List, Callable
 from pydantic import BaseModel
@@ -43,29 +44,62 @@ class ItineraryModel(BaseModel):
 # --- Cache Configuration ---
 CACHE_FILE = "flights_cache.db"
 CACHE_TTL = 6 * 3600  # 6 hours
+NEGATIVE_CACHE_TTL = 3600  # 1 hour
+DEFAULT_EARLY_RETURN_BUDGET_BUFFER = 25.0  # Euros; skip return fetch if remaining budget is below this
+_CACHE_CONN: Optional[sqlite3.Connection] = None
+
+
+def get_cache_connection() -> sqlite3.Connection:
+    """Returns a shared SQLite connection for cache operations."""
+    global _CACHE_CONN
+    if _CACHE_CONN is None:
+        _CACHE_CONN = sqlite3.connect(CACHE_FILE, timeout=30, check_same_thread=False)
+        _CACHE_CONN.execute("PRAGMA journal_mode=WAL")
+        _CACHE_CONN.execute("PRAGMA synchronous=NORMAL")
+    return _CACHE_CONN
+
+
+def close_cache_connection():
+    """Closes shared SQLite connection on process shutdown."""
+    global _CACHE_CONN
+    if _CACHE_CONN is not None:
+        try:
+            _CACHE_CONN.close()
+        finally:
+            _CACHE_CONN = None
 
 def init_cache():
     """Initializes the SQLite database for flight caching."""
-    conn = sqlite3.connect(CACHE_FILE)
+    conn = get_cache_connection()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS flights
-                 (key TEXT PRIMARY KEY, price_str TEXT, numeric_price REAL, flight_json TEXT, timestamp REAL)''')
-    c.execute("DELETE FROM flights WHERE numeric_price IS NULL OR numeric_price <= 0")
+                 (key TEXT PRIMARY KEY, price_str TEXT, numeric_price REAL, flight_json TEXT, timestamp REAL, no_result INTEGER DEFAULT 0)''')
+    columns = {row[1] for row in c.execute("PRAGMA table_info(flights)").fetchall()}
+    if "no_result" not in columns:
+        c.execute("ALTER TABLE flights ADD COLUMN no_result INTEGER DEFAULT 0")
+    c.execute("DELETE FROM flights WHERE no_result = 0 AND (numeric_price IS NULL OR numeric_price <= 0)")
     conn.commit()
-    conn.close()
 
 def get_cached_flight(origin, dest, date, adults, seat_type):
     """Retrieves a flight from cache if it exists and is not expired."""
     key = f"{origin}:{dest}:{date}:{adults}:{seat_type}"
     try:
-        conn = sqlite3.connect(CACHE_FILE)
+        conn = get_cache_connection()
         c = conn.cursor()
-        c.execute("SELECT price_str, numeric_price, flight_json, timestamp FROM flights WHERE key=?", (key,))
+        c.execute("SELECT price_str, numeric_price, flight_json, timestamp, no_result FROM flights WHERE key=?", (key,))
         row = c.fetchone()
-        conn.close()
         if row:
-            price_str, numeric_price, flight_json, timestamp = row
-            if time.time() - timestamp < CACHE_TTL:
+            price_str, numeric_price, flight_json, timestamp, no_result = row
+            ttl = NEGATIVE_CACHE_TTL if no_result else CACHE_TTL
+            if time.time() - timestamp < ttl:
+                if no_result:
+                    return {
+                        "destination": dest,
+                        "origin": origin,
+                        "date": date,
+                        "cached": True,
+                        "no_result": True,
+                    }
                 flight_payload = json.loads(flight_json)
                 if isinstance(flight_payload, dict) and not flight_payload.get("buy_link"):
                     flight_payload["buy_link"] = build_google_flights_link(origin, dest, date)
@@ -86,17 +120,34 @@ def set_cached_flight(origin, dest, date, adults, seat_type, result):
     """Stores a flight result in the cache."""
     key = f"{origin}:{dest}:{date}:{adults}:{seat_type}"
     try:
-        conn = sqlite3.connect(CACHE_FILE)
+        conn = get_cache_connection()
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO flights VALUES (?, ?, ?, ?, ?)",
-                  (key, result["price"], result["numeric_price"], json.dumps(result["flight"]), time.time()))
+        c.execute(
+            "INSERT OR REPLACE INTO flights (key, price_str, numeric_price, flight_json, timestamp, no_result) VALUES (?, ?, ?, ?, ?, 0)",
+            (key, result["price"], result["numeric_price"], json.dumps(result["flight"]), time.time())
+        )
         conn.commit()
-        conn.close()
+    except Exception as e:
+        print(f"Cache write error: {e}", file=sys.stderr)
+
+
+def set_cached_no_result(origin, dest, date, adults, seat_type):
+    """Stores a short-lived cache marker for routes with no results."""
+    key = f"{origin}:{dest}:{date}:{adults}:{seat_type}"
+    try:
+        conn = get_cache_connection()
+        c = conn.cursor()
+        c.execute(
+            "INSERT OR REPLACE INTO flights (key, price_str, numeric_price, flight_json, timestamp, no_result) VALUES (?, NULL, NULL, NULL, ?, 1)",
+            (key, time.time())
+        )
+        conn.commit()
     except Exception as e:
         print(f"Cache write error: {e}", file=sys.stderr)
 
 # Initialize cache on import
 init_cache()
+atexit.register(close_cache_connection)
 
 def normalize_stops(stops_value):
     """Normalizes stop values from provider payload to an integer."""
@@ -273,6 +324,10 @@ async def async_fetch_cheapest(
     cached = get_cached_flight(origin, dest, date, adults, seat_type)
     
     if cached:
+        if cached.get("no_result"):
+            if debug_callback:
+                debug_callback(f"CACHE_HIT_NONE {trace_label} {origin}->{dest}")
+            return None
         f = cached["flight"]
         if not is_valid_price(cached.get("numeric_price")):
             if debug_callback:
@@ -322,10 +377,11 @@ async def async_fetch_cheapest(
 
                 if res and res.flights:
                     total_flights = len(res.flights)
-                    valid_flights = [
+                    base_valid_flights = [
                         f for f in res.flights
                         if f.price != "Unavailable" and is_valid_price(parse_price(getattr(f, "price", None)))
                     ]
+                    valid_flights = list(base_valid_flights)
                     
                     # Apply filters
                     if direct_only:
@@ -361,8 +417,17 @@ async def async_fetch_cheapest(
                         if debug_callback:
                             debug_callback(f"FETCH_PICK {trace_label} {origin}->{dest} cheapest={cheapest_price} raw={cheapest.price}")
                         return result
+
+                    if not base_valid_flights:
+                        set_cached_no_result(origin, dest, date, adults, seat_type)
+                        if debug_callback:
+                            debug_callback(f"FETCH_CACHE_NONE {trace_label} {origin}->{dest}")
                     if debug_callback:
                         debug_callback(f"FETCH_DROP {trace_label} {origin}->{dest} no valid flights after filters")
+                else:
+                    set_cached_no_result(origin, dest, date, adults, seat_type)
+                    if debug_callback:
+                        debug_callback(f"FETCH_CACHE_NONE {trace_label} {origin}->{dest} empty response")
                 return None
             return None
 
@@ -451,6 +516,10 @@ async def find_cheapest_two_city_itinerary_logic(
     include_airlines: list = None,
     exclude_airlines: list = None,
     max_budget: Optional[float] = None,
+    search_concurrency: Optional[int] = None,
+    step1_multiplier: float = 1.0,
+    max_cityb_per_citya: int = 8,
+    early_return_buffer: float = DEFAULT_EARLY_RETURN_BUDGET_BUFFER,
     debug: bool = False,
     debug_callback: Optional[Callable[[str], None]] = None
 ):
@@ -491,8 +560,20 @@ async def find_cheapest_two_city_itinerary_logic(
         "final_itineraries": 0,
     }
     inflight_requests: Dict[Any, asyncio.Task] = {}
-    destination_concurrency = compute_concurrency(limit_per_leg, max_concurrency=3)
-    return_concurrency = compute_concurrency(limit_per_leg, max_concurrency=4)
+    step1_multiplier = max(1.0, float(step1_multiplier or 1.0))
+    max_cityb_per_citya = max(1, int(max_cityb_per_citya or 1))
+    early_return_buffer = max(0.0, float(early_return_buffer if early_return_buffer is not None else DEFAULT_EARLY_RETURN_BUDGET_BUFFER))
+
+    destination_concurrency = (
+        max(1, int(search_concurrency))
+        if search_concurrency is not None
+        else compute_concurrency(limit_per_leg, max_concurrency=6)
+    )
+    return_concurrency = (
+        max(1, int(search_concurrency))
+        if search_concurrency is not None
+        else compute_concurrency(limit_per_leg, max_concurrency=8)
+    )
     dlog(f"RUN_START origins={origins} region={region} limit={limit_per_leg} budget={max_budget}")
     dlog(f"RUN_CONCURRENCY destination={destination_concurrency} return={return_concurrency}")
 
@@ -507,8 +588,9 @@ async def find_cheapest_two_city_itinerary_logic(
             if origin_country:
                 step1_excluded.append(origin_country)
 
+        step1_limit = max(int(limit_per_leg * step1_multiplier), 4)
         sweep_tasks.append(get_cheapest_destinations_logic(
-            o, date_1, region, limit=max(limit_per_leg * 2, 4), 
+            o, date_1, region, limit=step1_limit,
             excluded_countries=step1_excluded, excluded_airports=excluded_airports, 
             direct_only=direct_only, include_airlines=include_airlines, exclude_airlines=exclude_airlines,
             debug_callback=dlog, trace_label="STEP1",
@@ -586,7 +668,8 @@ async def find_cheapest_two_city_itinerary_logic(
         cand_a, s1, _ = task_metadata_2[i]
         orig = cand_a["search_origin"]
         
-        for cand_b in res_b["cheapest_options"]:
+        city_b_candidates = res_b["cheapest_options"][:max_cityb_per_citya]
+        for cand_b in city_b_candidates:
             # Ensure City B is not an origin or City A
             if cand_b["destination"] in origins or cand_b["destination"] == cand_a["destination"]: continue
             
@@ -596,9 +679,11 @@ async def find_cheapest_two_city_itinerary_logic(
             for s2 in stay2_range:
                 # Early Exit logic: if Leg 1 + Leg 2 already exceeds budget, don't even check the return
                 current_cost = cand_a["numeric_price"] + cand_b["numeric_price"]
-                if max_budget and current_cost >= max_budget:
-                    stats["step3_budget_pruned"] += 1
-                    continue
+                if max_budget:
+                    remaining_budget = max_budget - current_cost
+                    if remaining_budget <= 0 or remaining_budget < early_return_buffer:
+                        stats["step3_budget_pruned"] += 1
+                        continue
 
                 date_3 = (dt_start + datetime.timedelta(days=s1 + s2)).strftime('%Y-%m-%d')
                 return_tasks.append((cand_a, cand_b, async_fetch_cheapest(
@@ -628,84 +713,85 @@ async def find_cheapest_two_city_itinerary_logic(
                 stats["final_budget_pruned"] += 1
                 continue
 
-            try:
-                # Detect Airport Change Warnings
-                warning_msg = None
-                # Check Leg 1 -> Leg 2
-                if c_a["destination"] != c_b["origin"]:
-                    hub_a = get_airport_hub(c_a["destination"])
-                    hub_b = get_airport_hub(c_b["origin"])
-                    if hub_a and hub_a == hub_b:
-                        warning_msg = f"Airport change required in {hub_a} ({c_a['destination']} to {c_b['origin']})"
-                
-                # Check Leg 2 -> Leg 3 (Return)
-                if not warning_msg and c_b["destination"] != ret_dest:
-                    hub_b = get_airport_hub(c_b["destination"])
-                    hub_ret = get_airport_hub(ret_dest)
-                    if hub_b and hub_b == hub_ret:
-                        warning_msg = f"Airport change required in {hub_b} ({c_b['destination']} to {ret_dest})"
+            # Detect Airport Change Warnings
+            warning_msg = None
+            if c_a["destination"] != c_b["origin"]:
+                hub_a = get_airport_hub(c_a["destination"])
+                hub_b = get_airport_hub(c_b["origin"])
+                if hub_a and hub_a == hub_b:
+                    warning_msg = f"Airport change required in {hub_a} ({c_a['destination']} to {c_b['origin']})"
 
-                # Validate with Pydantic
-                itinerary_obj = ItineraryModel(
-                    total_price=total_price,
-                    origin=orig,
-                    return_destination=ret_dest,
-                    legs=[
-                        ItineraryLeg(
-                            origin=orig,
-                            destination=c_a["destination"],
-                            date=c_a["date"],
-                            price=c_a["price"],
-                            stops=normalize_stops(c_a["flight"].get("stops", 0)),
-                            carrier=c_a["flight"].get("airline"),
-                            departure=c_a["flight"].get("departure"),
-                            arrival=c_a["flight"].get("arrival"),
-                            duration=c_a["flight"].get("duration"),
-                            buy_link=c_a["flight"].get("buy_link"),
-                        ),
-                        ItineraryLeg(
-                            origin=c_a["destination"],
-                            destination=c_b["destination"],
-                            date=c_b["date"],
-                            price=c_b["price"],
-                            stops=normalize_stops(c_b["flight"].get("stops", 0)),
-                            carrier=c_b["flight"].get("airline"),
-                            departure=c_b["flight"].get("departure"),
-                            arrival=c_b["flight"].get("arrival"),
-                            duration=c_b["flight"].get("duration"),
-                            buy_link=c_b["flight"].get("buy_link"),
-                        ),
-                        ItineraryLeg(
-                            origin=c_b["destination"],
-                            destination=ret_dest,
-                            date=res_ret["date"],
-                            price=res_ret["price"],
-                            stops=normalize_stops(res_ret["flight"].get("stops", 0)),
-                            carrier=res_ret["flight"].get("airline"),
-                            departure=res_ret["flight"].get("departure"),
-                            arrival=res_ret["flight"].get("arrival"),
-                            duration=res_ret["flight"].get("duration"),
-                            buy_link=res_ret["flight"].get("buy_link"),
-                        )
-                    ],
-                    cached=any([c_a.get("cached"), c_b.get("cached"), res_ret.get("cached")]),
-                    warning=warning_msg
-                )
-                itineraries.append(itinerary_obj.model_dump())
-            except Exception as e:
-                print(f"Validation error for itinerary: {e}", file=sys.stderr)
-                continue
+            if not warning_msg and c_b["destination"] != ret_dest:
+                hub_b = get_airport_hub(c_b["destination"])
+                hub_ret = get_airport_hub(ret_dest)
+                if hub_b and hub_b == hub_ret:
+                    warning_msg = f"Airport change required in {hub_b} ({c_b['destination']} to {ret_dest})"
+
+            itineraries.append({
+                "total_price": total_price,
+                "origin": orig,
+                "return_destination": ret_dest,
+                "legs": [
+                    {
+                        "origin": orig,
+                        "destination": c_a["destination"],
+                        "date": c_a["date"],
+                        "price": c_a["price"],
+                        "stops": normalize_stops(c_a["flight"].get("stops", 0)),
+                        "carrier": c_a["flight"].get("airline"),
+                        "departure": c_a["flight"].get("departure"),
+                        "arrival": c_a["flight"].get("arrival"),
+                        "duration": c_a["flight"].get("duration"),
+                        "buy_link": c_a["flight"].get("buy_link"),
+                    },
+                    {
+                        "origin": c_a["destination"],
+                        "destination": c_b["destination"],
+                        "date": c_b["date"],
+                        "price": c_b["price"],
+                        "stops": normalize_stops(c_b["flight"].get("stops", 0)),
+                        "carrier": c_b["flight"].get("airline"),
+                        "departure": c_b["flight"].get("departure"),
+                        "arrival": c_b["flight"].get("arrival"),
+                        "duration": c_b["flight"].get("duration"),
+                        "buy_link": c_b["flight"].get("buy_link"),
+                    },
+                    {
+                        "origin": c_b["destination"],
+                        "destination": ret_dest,
+                        "date": res_ret["date"],
+                        "price": res_ret["price"],
+                        "stops": normalize_stops(res_ret["flight"].get("stops", 0)),
+                        "carrier": res_ret["flight"].get("airline"),
+                        "departure": res_ret["flight"].get("departure"),
+                        "arrival": res_ret["flight"].get("arrival"),
+                        "duration": res_ret["flight"].get("duration"),
+                        "buy_link": res_ret["flight"].get("buy_link"),
+                    }
+                ],
+                "cached": any([c_a.get("cached"), c_b.get("cached"), res_ret.get("cached")]),
+                "warning": warning_msg,
+            })
         else:
             stats["step3_missing_return"] += 1
 
     itineraries.sort(key=lambda x: x["total_price"])
-    stats["final_itineraries"] = len(itineraries[:max_itineraries])
+    top_itineraries = itineraries[:max_itineraries]
+    validated_itineraries = []
+    for item in top_itineraries:
+        try:
+            itinerary_obj = ItineraryModel.model_validate(item)
+            validated_itineraries.append(itinerary_obj.model_dump())
+        except Exception as e:
+            print(f"Validation error for itinerary: {e}", file=sys.stderr)
+
+    stats["final_itineraries"] = len(validated_itineraries)
     dlog(
         "RUN_DONE "
         f"itineraries={stats['final_itineraries']} missing_return={stats['step3_missing_return']} "
         f"final_budget_pruned={stats['final_budget_pruned']}"
     )
-    result_payload = {"itineraries": itineraries[:max_itineraries]}
+    result_payload = {"itineraries": validated_itineraries}
     if debug:
         result_payload["debug_stats"] = stats
     return result_payload

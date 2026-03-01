@@ -110,6 +110,10 @@ async def async_main():
     parser.add_argument("--exclude-airlines", nargs="+", help="Exclude these airlines")
     parser.add_argument("--export", help="Export path (e.g. results.json or results.csv)")
     parser.add_argument("--max-budget", type=float, help="Maximum total price for the trip")
+    parser.add_argument("--search-concurrency", type=int, help="Override async concurrency for odyssey searches")
+    parser.add_argument("--step1-multiplier", type=float, default=1.0, help="Step1 breadth multiplier for odyssey mode")
+    parser.add_argument("--max-cityb-per-citya", type=int, default=8, help="Cap City B candidates per City A in odyssey mode")
+    parser.add_argument("--early-return-buffer", type=float, default=25.0, help="Minimum remaining budget before checking return leg in odyssey mode")
     parser.add_argument("--deal-threshold", type=float, help="Highlight itineraries under this price")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
     parser.add_argument("--debug-log", help="Optional path to write debug logs")
@@ -228,6 +232,10 @@ async def async_main():
                 include_airlines=args.include_airlines,
                 exclude_airlines=args.exclude_airlines,
                 max_budget=args.max_budget,
+                search_concurrency=args.search_concurrency,
+                step1_multiplier=args.step1_multiplier,
+                max_cityb_per_citya=args.max_cityb_per_citya,
+                early_return_buffer=args.early_return_buffer,
                 debug=args.debug,
                 debug_callback=debug_log,
             )
@@ -351,7 +359,11 @@ async def async_main():
 
 
 def main():
-    asyncio.run(async_main())
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]Interrupted by user. Exiting...[/bold yellow]")
+        sys.exit(0)
 
 
 if __name__ == "__main__":

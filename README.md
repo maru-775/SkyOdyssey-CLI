@@ -111,6 +111,7 @@ SkyOdyssey searches for 3-leg loops:
 The search prunes aggressively:
 
 - If leg1 + leg2 already exceeds budget, leg3 is skipped
+- If remaining budget after leg1 + leg2 is below `--early-return-buffer`, leg3 is skipped
 - Completed itineraries over budget are dropped
 
 If your budget is tight, getting no results is expected even when valid flights exist.
@@ -154,6 +155,10 @@ If your budget is tight, getting no results is expected even when valid flights 
 --exclude-airlines     Exclude selected airlines
 
 --max-budget           Maximum total itinerary price
+--search-concurrency   Override async concurrency for odyssey search stages
+--step1-multiplier     Step 1 breadth multiplier (City A sweep)
+--max-cityb-per-citya  Cap City B branches per City A
+--early-return-buffer  Min remaining budget required before checking return leg
 --deal-threshold       Highlight deals under threshold
 
 --export               Output file (.json or .csv)
@@ -232,6 +237,12 @@ skyodyssey --origin LYS --date 2026-04-19 --export results.json
 skyodyssey --origin LYS --date 2026-04-19 --export results.csv
 ```
 
+### 8) High-performance odyssey tuning
+
+```bash
+skyodyssey --origin LYS --date 2026-04-19 --odyssey --stay1 3 --stay2 2 --max-budget 150 --different-countries --region All --limit 50 --max-results 30 --search-concurrency 10 --max-cityb-per-citya 6 --early-return-buffer 20
+```
+
 ---
 
 ## Output Format
@@ -257,10 +268,20 @@ Each result row contains:
 For faster results at larger search widths:
 
 1. Start with moderate `--limit` (`3-8`), then increase
-2. Use `--max-budget` to prune expensive branches early
-3. Use `--direct` if your use case allows
-4. Warm cache with a smaller run, then run broader search
-5. Use `--debug` to inspect where pruning is happening
+2. Use `--max-budget` and `--early-return-buffer` to prune expensive branches early
+3. Use `--search-concurrency` (`6-10` usually good) to reduce wall-clock time
+4. Keep `--max-cityb-per-citya` moderate (`4-10`) to avoid Step 3 explosion
+5. Use `--step1-multiplier` (`1.0-1.5`) if you want wider first-leg exploration
+6. Use `--direct` if your use case allows
+7. Warm cache with a smaller run, then run broader search
+8. Use `--debug` to inspect where pruning is happening
+
+Meaning of the new odyssey tuning flags:
+
+- `--search-concurrency`: number of simultaneous route checks
+- `--step1-multiplier`: scales City A sweep width as `limit * multiplier`
+- `--max-cityb-per-citya`: max City B candidates kept per City A candidate
+- `--early-return-buffer`: minimum remaining budget required before querying return leg
 
 Notes:
 
@@ -273,8 +294,10 @@ Notes:
 ## Caching
 
 - Cache database: `flights_cache.db`
-- TTL: 6 hours
+- Positive-result TTL: 6 hours
+- Negative-result TTL (no-route marker): 1 hour
 - Invalid cached prices (`<= 0`) are cleaned automatically
+- Cache uses a shared SQLite connection for lower per-request overhead
 
 You can remove cache manually if needed:
 
