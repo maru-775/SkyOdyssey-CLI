@@ -48,6 +48,9 @@ NEGATIVE_CACHE_TTL = 3600  # 1 hour
 DEFAULT_EARLY_RETURN_BUDGET_BUFFER = 25.0  # Euros; skip return fetch if remaining budget is below this
 _CACHE_CONN: Optional[sqlite3.Connection] = None
 
+# --- In-Memory Search Cache (Run-Time Only) ---
+SWEEP_CACHE: Dict[tuple, Any] = {}
+
 
 def get_cache_connection() -> sqlite3.Connection:
     """Returns a shared SQLite connection for cache operations."""
@@ -469,9 +472,18 @@ async def get_cheapest_destinations_logic(
     trace_label: str = "",
     inflight_requests: Optional[Dict[Any, asyncio.Task]] = None,
     concurrency: Optional[int] = None,
+    shared_semaphore: Optional[asyncio.Semaphore] = None,
 ):
     """Business logic for exploring multiple destinations in parallel."""
     origin = origin.upper()
+    
+    # Check Sweep Cache
+    cache_key = (origin, date, region, limit, direct_only, tuple(sorted(include_airlines or [])), tuple(sorted(exclude_airlines or [])))
+    if cache_key in SWEEP_CACHE:
+        if debug_callback:
+            debug_callback(f"SWEEP_CACHE_HIT {trace_label} origin={origin} date={date}")
+        return SWEEP_CACHE[cache_key]
+
     destinations = get_airports_excluding(region, excluded_countries, excluded_airports)
     if not destinations:
         if debug_callback:
@@ -483,7 +495,7 @@ async def get_cheapest_destinations_logic(
         debug_callback(f"DEST_LIST {trace_label} origin={origin} region={region} count={len(destinations)} limit={limit}")
     
     resolved_concurrency = concurrency if concurrency is not None else compute_concurrency(limit)
-    semaphore = asyncio.Semaphore(resolved_concurrency)
+    semaphore = shared_semaphore if shared_semaphore is not None else asyncio.Semaphore(resolved_concurrency)
     tasks = [async_fetch_cheapest(
         origin, d, date, semaphore, adults, seat_type, 
         direct_only=direct_only, include_airlines=include_airlines, exclude_airlines=exclude_airlines,
@@ -497,7 +509,9 @@ async def get_cheapest_destinations_logic(
     if debug_callback:
         debug_callback(f"DEST_RESULT {trace_label} origin={origin} kept={len(results)} concurrency={resolved_concurrency}")
     
-    return {"origin": origin, "date": date, "cheapest_options": results}
+    sweep_result = {"origin": origin, "date": date, "cheapest_options": results}
+    SWEEP_CACHE[cache_key] = sweep_result
+    return sweep_result
 
 async def find_cheapest_two_city_itinerary_logic(
     origin: Any, # Can be str or List[str]
@@ -521,7 +535,8 @@ async def find_cheapest_two_city_itinerary_logic(
     max_cityb_per_citya: int = 8,
     early_return_buffer: float = DEFAULT_EARLY_RETURN_BUDGET_BUFFER,
     debug: bool = False,
-    debug_callback: Optional[Callable[[str], None]] = None
+    debug_callback: Optional[Callable[[str], None]] = None,
+    dedupe_cities: bool = False
 ):
     """Business logic for finding the cheapest 3-leg loop itinerary with flexible stay ranges and multi-origin support."""
     try:
@@ -540,6 +555,9 @@ async def find_cheapest_two_city_itinerary_logic(
         # Handle multi-origin and normalize codes
         origins = [o.upper() for o in ([origin] if isinstance(origin, str) else list(origin))]
         normalized_return_origin = return_origin.upper() if return_origin else None
+        
+        # Reset run-specific sweep cache
+        SWEEP_CACHE.clear()
 
     except (ValueError, TypeError):
         return {"error": "Invalid start_date or stay_days format."}
@@ -563,238 +581,227 @@ async def find_cheapest_two_city_itinerary_logic(
     step1_multiplier = max(1.0, float(step1_multiplier or 1.0))
     max_cityb_per_citya = max(1, int(max_cityb_per_citya or 1))
     early_return_buffer = max(0.0, float(early_return_buffer if early_return_buffer is not None else DEFAULT_EARLY_RETURN_BUDGET_BUFFER))
-
-    destination_concurrency = (
+    search_concurrency_val = (
         max(1, int(search_concurrency))
         if search_concurrency is not None
-        else compute_concurrency(limit_per_leg, max_concurrency=6)
+        else compute_concurrency(limit_per_leg, max_concurrency=10)
     )
-    return_concurrency = (
-        max(1, int(search_concurrency))
-        if search_concurrency is not None
-        else compute_concurrency(limit_per_leg, max_concurrency=8)
-    )
-    dlog(f"RUN_START origins={origins} region={region} limit={limit_per_leg} budget={max_budget}")
-    dlog(f"RUN_CONCURRENCY destination={destination_concurrency} return={return_concurrency}")
+    shared_semaphore = asyncio.Semaphore(search_concurrency_val)
 
-    # Step 1: Broad sweep for City A candidates from ALL origins
-    if progress_callback: progress_callback("Searching for primary destinations from all origins...")
-    
-    sweep_tasks = []
+    dlog(f"RUN_START_GRAPH origins={origins} region={region} limit={limit_per_leg} budget={max_budget}")
+    dlog(f"RUN_CONCURRENCY total={search_concurrency_val}")
+
+    # --- Stage 1: Bi-Directional Discovery ---
+    # We find cheap ways OUT and cheap ways IN. 
+    # Any city that is cheap to fly TO and cheap to fly FROM becomes a "Hub Candidate".
+
+    if progress_callback: progress_callback("Discovering best outbound and inbound hubs...")
+
+    outbound_tasks = []
     for o in origins:
+        # Step 1 Outbound Sweep: apply initial country exclusions if needed
         step1_excluded = list(excluded_countries or [])
         if force_different_countries:
             origin_country = AIRPORT_TO_COUNTRY.get(o)
-            if origin_country:
+            if origin_country and origin_country not in step1_excluded:
                 step1_excluded.append(origin_country)
 
-        step1_limit = max(int(limit_per_leg * step1_multiplier), 4)
-        sweep_tasks.append(get_cheapest_destinations_logic(
-            o, date_1, region, limit=step1_limit,
-            excluded_countries=step1_excluded, excluded_airports=excluded_airports, 
+        outbound_tasks.append(get_cheapest_destinations_logic(
+            o, date_1, region, limit=int(limit_per_leg * 2.5),
+            excluded_countries=step1_excluded, excluded_airports=excluded_airports,
             direct_only=direct_only, include_airlines=include_airlines, exclude_airlines=exclude_airlines,
-            debug_callback=dlog, trace_label="STEP1",
+            debug_callback=dlog, trace_label="OUTBOUND_SWEEP",
             inflight_requests=inflight_requests,
-            concurrency=destination_concurrency,
+            shared_semaphore=shared_semaphore,
         ))
-    
-    sweep_results = await asyncio.gather(*sweep_tasks)
-    
-    all_candidates_a = []
-    for i, res_a in enumerate(sweep_results):
-        if "cheapest_options" in res_a:
-            orig = origins[i]
-            for opt in res_a["cheapest_options"][:limit_per_leg]:
-                if max_budget and opt["numeric_price"] > max_budget:
-                    stats["step1_budget_pruned"] += 1
-                    continue
-                opt["search_origin"] = orig # Track which origin this came from
-                all_candidates_a.append(opt)
-    stats["step1_candidates"] = len(all_candidates_a)
-    dlog(f"STEP1_DONE candidates={stats['step1_candidates']} budget_pruned={stats['step1_budget_pruned']}")
 
-    if not all_candidates_a:
-        return {"error": "No candidates found from any origin."}
+    # For inbound, we search ReturnOrigin -> Anywhere on the final day.
+    # While pricing is not always symmetric, it's the fastest way to find 
+    # airports that are "well-connected" to our return base.
+    ret_dest = normalized_return_origin if normalized_return_origin else origins[0]
+    # Estimate final day: we'll use stay1_max + stay2_max to find a safe window
+    max_stay_total = 0
+    if isinstance(stay_days_1, list): max_stay_total += stay_days_1[1]
+    else: max_stay_total += int(stay_days_1)
+    if isinstance(stay_days_2, list): max_stay_total += stay_days_2[1]
+    else: max_stay_total += int(stay_days_2)
     
-    # Sort and limit to best global candidates for leg 1
-    all_candidates_a.sort(key=lambda x: x["numeric_price"])
-    candidates_a = all_candidates_a[:limit_per_leg * len(origins)]
-    
-    itineraries = []
-    
-    # Step 2: Branch for each City A AND each possible stay duration
-    if progress_callback: progress_callback(f"Exploring second leg for {len(candidates_a)} City A candidates...")
-    
-    second_leg_tasks = []
-    task_metadata_2 = [] 
-
-    for cand_a in candidates_a:
-        city_a = cand_a["destination"]
-        country_a = AIRPORT_TO_COUNTRY.get(city_a.upper())
-        search_origin = cand_a["search_origin"]
-        origin_country = AIRPORT_TO_COUNTRY.get(search_origin.upper())
-        step2_excluded = list(excluded_countries or [])
-        if force_different_countries:
-            if country_a:
-                step2_excluded.append(country_a)
-            if origin_country:
-                step2_excluded.append(origin_country)
-
-        for s1 in stay1_range:
-            date_2 = (dt_start + datetime.timedelta(days=s1)).strftime('%Y-%m-%d')
-            second_leg_tasks.append(get_cheapest_destinations_logic(
-                city_a, date_2, region, limit=limit_per_leg, 
-                excluded_countries=step2_excluded, excluded_airports=excluded_airports, 
-                direct_only=direct_only, include_airlines=include_airlines, exclude_airlines=exclude_airlines,
-                debug_callback=dlog, trace_label="STEP2",
-                inflight_requests=inflight_requests,
-                concurrency=destination_concurrency,
-            ))
-            task_metadata_2.append((cand_a, s1, date_2))
-            stats["step2_tasks"] += 1
-
-    leg2_results = await asyncio.gather(*second_leg_tasks)
-    
-    # Step 3: Branch for each City B AND each possible stay duration
-    if progress_callback: progress_callback("Calculating return legs and final prices...")
-    
-    return_tasks = []
-    semaphore = asyncio.Semaphore(return_concurrency)
-    
-    for i, res_b in enumerate(leg2_results):
-        if "cheapest_options" not in res_b: continue
-        stats["step2_candidates"] += len(res_b.get("cheapest_options", []))
-        
-        cand_a, s1, _ = task_metadata_2[i]
-        orig = cand_a["search_origin"]
-        
-        city_b_candidates = res_b["cheapest_options"][:max_cityb_per_citya]
-        for cand_b in city_b_candidates:
-            # Ensure City B is not an origin or City A
-            if cand_b["destination"] in origins or cand_b["destination"] == cand_a["destination"]: continue
-            
-            # Use return_origin if provided, otherwise the search origin
-            ret_dest = normalized_return_origin if normalized_return_origin else orig
-
-            for s2 in stay2_range:
-                # Early Exit logic: if Leg 1 + Leg 2 already exceeds budget, don't even check the return
-                current_cost = cand_a["numeric_price"] + cand_b["numeric_price"]
-                if max_budget:
-                    remaining_budget = max_budget - current_cost
-                    if remaining_budget <= 0 or remaining_budget < early_return_buffer:
-                        stats["step3_budget_pruned"] += 1
-                        continue
-
-                date_3 = (dt_start + datetime.timedelta(days=s1 + s2)).strftime('%Y-%m-%d')
-                return_tasks.append((cand_a, cand_b, async_fetch_cheapest(
-                    cand_b["destination"], ret_dest, date_3, semaphore, 
-                    direct_only=direct_only, include_airlines=include_airlines, exclude_airlines=exclude_airlines,
-                    debug_callback=dlog, trace_label="STEP3",
-                    inflight_requests=inflight_requests,
-                )))
-                stats["step3_return_tasks"] += 1
-
-    dlog(
-        "STEP3_PREP "
-        f"step2_tasks={stats['step2_tasks']} step2_candidates={stats['step2_candidates']} "
-        f"return_tasks={stats['step3_return_tasks']} pruned_budget={stats['step3_budget_pruned']}"
+    date_final_approx = (dt_start + datetime.timedelta(days=max_stay_total)).strftime('%Y-%m-%d')
+    inbound_sweep_task = get_cheapest_destinations_logic(
+        ret_dest, date_final_approx, region, limit=int(limit_per_leg * 2.5),
+        excluded_countries=excluded_countries, excluded_airports=excluded_airports,
+        direct_only=direct_only, include_airlines=include_airlines, exclude_airlines=exclude_airlines,
+        debug_callback=dlog, trace_label="INBOUND_HUB_SWEEP",
+        inflight_requests=inflight_requests,
+        shared_semaphore=shared_semaphore,
     )
 
-    completed_returns = await asyncio.gather(*(t[2] for t in return_tasks))
+    all_stage1 = await asyncio.gather(*outbound_tasks, inbound_sweep_task)
+    sweep_results_out = all_stage1[:-1]
+    inbound_sweep = all_stage1[-1]
+
+    # Process Outbound Candidates (A)
+    candidates_a = []
+    for i, res in enumerate(sweep_results_out):
+        if "cheapest_options" in res:
+            orig = origins[i]
+            for opt in res["cheapest_options"]:
+                if max_budget and opt["numeric_price"] > (max_budget * 0.7): continue # Leg 1 shouldn't eat whole budget
+                opt["search_origin"] = orig
+                candidates_a.append(opt)
     
-    for i, res_ret in enumerate(completed_returns):
-        if res_ret:
-            c_a, c_b, _ = return_tasks[i]
-            orig = c_a["search_origin"]
-            ret_dest = normalized_return_origin if normalized_return_origin else orig
-            total_price = c_a["numeric_price"] + c_b["numeric_price"] + res_ret["numeric_price"]
+    # Process Inbound Candidates (B)
+    # These are cities that return TO ret_dest on the final leg.
+    candidates_b_hubs = []
+    if "cheapest_options" in inbound_sweep:
+        for opt in inbound_sweep["cheapest_options"]:
+            candidates_b_hubs.append(opt["destination"])
+
+    dlog(f"STAGE1_DONE outbound={len(candidates_a)} inbound_hubs={len(candidates_b_hubs)}")
+
+    # --- Stage 2: Bridge Joining (The Join) ---
+    # Now we need to bridge A -> B for every possible combination and stay duration.
+    # We prune heavily.
+
+    if progress_callback: progress_callback("Connecting hubs and verifying routes...")
+
+    itineraries = []
+    bridge_tasks = []
+    
+    # Dynamic Hub Limits based on limit_per_leg
+    MAX_A = limit_per_leg
+    MAX_B = int(limit_per_leg * 1.2) # Slightly more inbound hubs to increase join matches
+    
+    top_a = sorted(candidates_a, key=lambda x: x["numeric_price"])[:MAX_A]
+    top_b_hubs = candidates_b_hubs[:MAX_B]
+
+    dlog(f"STAGE2_SPACE candidates_a={len(top_a)} candidate_b_hubs={len(top_b_hubs)}")
+
+    for c_a in top_a:
+        city_a = c_a["destination"]
+        search_origin = c_a["search_origin"]
+        country_a = AIRPORT_TO_COUNTRY.get(city_a.upper())
+        country_orig = AIRPORT_TO_COUNTRY.get(search_origin.upper())
+
+        for city_b in top_b_hubs:
+            if city_a == city_b: continue
+            if city_b in origins: continue
             
-            if max_budget and total_price > max_budget:
-                stats["final_budget_pruned"] += 1
-                continue
+            country_b = AIRPORT_TO_COUNTRY.get(city_b.upper())
+            
+            if force_different_countries:
+                # 1. City A must be different country from Origin
+                if country_orig and country_a == country_orig: continue
+                # 2. City B must be different country from Origin
+                if country_orig and country_b == country_orig: continue
+                # 3. City A and City B must be in different countries
+                if country_a and country_b and country_a == country_b: continue
 
-            # Detect Airport Change Warnings
-            warning_msg = None
-            if c_a["destination"] != c_b["origin"]:
-                hub_a = get_airport_hub(c_a["destination"])
-                hub_b = get_airport_hub(c_b["origin"])
-                if hub_a and hub_a == hub_b:
-                    warning_msg = f"Airport change required in {hub_a} ({c_a['destination']} to {c_b['origin']})"
+            for s1 in stay1_range:
+                for s2 in stay2_range:
+                    date_2 = (dt_start + datetime.timedelta(days=s1)).strftime('%Y-%m-%d')
+                    date_3 = (dt_start + datetime.timedelta(days=s1 + s2)).strftime('%Y-%m-%d')
+                    
+                    # Estimate if this pair is even possible
+                    # We don't have the real Leg 2 or Leg 3 price yet, but we have Leg 1.
+                    # Price(Leg 1) + Hub_B_Return_Estimate
+                    # For Hub_B_Return_Estimate, we just pick the price from the inbound sweep (heuristic)
+                    # Find opt in inbound_sweep for city_b
+                    price_b_ret_est = 50.0 # Default fallback
+                    inbound_opt = next((o for o in inbound_sweep.get("cheapest_options", []) if o["destination"] == city_b), None)
+                    if inbound_opt: price_b_ret_est = inbound_opt["numeric_price"]
 
-            if not warning_msg and c_b["destination"] != ret_dest:
-                hub_b = get_airport_hub(c_b["destination"])
-                hub_ret = get_airport_hub(ret_dest)
-                if hub_b and hub_b == hub_ret:
-                    warning_msg = f"Airport change required in {hub_b} ({c_b['destination']} to {ret_dest})"
+                    if max_budget:
+                        if (c_a["numeric_price"] + price_b_ret_est) > (max_budget - 20): # 20 for leg 2
+                             continue
+                    
+                    # Fire parallel tasks for Leg 2 and Leg 3 (verified)
+                    # We use nested gather later
+                    async def check_full_path(ca=c_a, cb_hub=city_b, d2=date_2, d3=date_3, rd=ret_dest):
+                        # Task 2.1: Verify A -> B
+                        leg2 = await async_fetch_cheapest(
+                            ca["destination"], cb_hub, d2, shared_semaphore,
+                            direct_only=direct_only, include_airlines=include_airlines, exclude_airlines=exclude_airlines,
+                            debug_callback=dlog, trace_label="STAGE2_BRIDGE",
+                            inflight_requests=inflight_requests
+                        )
+                        if not leg2: return None
+                        
+                        # Task 2.2: Verify B -> Return
+                        leg3 = await async_fetch_cheapest(
+                            cb_hub, rd, d3, shared_semaphore,
+                            direct_only=direct_only, include_airlines=include_airlines, exclude_airlines=exclude_airlines,
+                            debug_callback=dlog, trace_label="STAGE3_FINAL",
+                            inflight_requests=inflight_requests
+                        )
+                        if not leg3: return None
+                        
+                        total = ca["numeric_price"] + leg2["numeric_price"] + leg3["numeric_price"]
+                        if max_budget and total > max_budget: return None
+                        
+                        return {
+                            "total_price": total,
+                            "origin": ca["search_origin"],
+                            "return_destination": rd,
+                            "legs": [
+                                {
+                                    "origin": ca["search_origin"], "destination": ca["destination"], "date": ca["date"],
+                                    "price": ca["price"], "stops": normalize_stops(ca["flight"].get("stops", 0)),
+                                    "carrier": ca["flight"].get("airline"), "departure": ca["flight"].get("departure"),
+                                    "arrival": ca["flight"].get("arrival"), "duration": ca["flight"].get("duration"),
+                                    "buy_link": ca["flight"].get("buy_link")
+                                },
+                                {
+                                    "origin": ca["destination"], "destination": cb_hub, "date": d2,
+                                    "price": leg2["price"], "stops": normalize_stops(leg2["flight"].get("stops", 0)),
+                                    "carrier": leg2["flight"].get("airline"), "departure": leg2["flight"].get("departure"),
+                                    "arrival": leg2["flight"].get("arrival"), "duration": leg2["flight"].get("duration"),
+                                    "buy_link": leg2["flight"].get("buy_link")
+                                },
+                                {
+                                    "origin": cb_hub, "destination": rd, "date": d3,
+                                    "price": leg3["price"], "stops": normalize_stops(leg3["flight"].get("stops", 0)),
+                                    "carrier": leg3["flight"].get("airline"), "departure": leg3["flight"].get("departure"),
+                                    "arrival": leg3["flight"].get("arrival"), "duration": leg3["flight"].get("duration"),
+                                    "buy_link": leg3["flight"].get("buy_link")
+                                }
+                            ],
+                            "cached": any([ca.get("cached"), leg2.get("cached"), leg3.get("cached")]),
+                            "warning": None # Can add hub checks later
+                        }
 
-            itineraries.append({
-                "total_price": total_price,
-                "origin": orig,
-                "return_destination": ret_dest,
-                "legs": [
-                    {
-                        "origin": orig,
-                        "destination": c_a["destination"],
-                        "date": c_a["date"],
-                        "price": c_a["price"],
-                        "stops": normalize_stops(c_a["flight"].get("stops", 0)),
-                        "carrier": c_a["flight"].get("airline"),
-                        "departure": c_a["flight"].get("departure"),
-                        "arrival": c_a["flight"].get("arrival"),
-                        "duration": c_a["flight"].get("duration"),
-                        "buy_link": c_a["flight"].get("buy_link"),
-                    },
-                    {
-                        "origin": c_a["destination"],
-                        "destination": c_b["destination"],
-                        "date": c_b["date"],
-                        "price": c_b["price"],
-                        "stops": normalize_stops(c_b["flight"].get("stops", 0)),
-                        "carrier": c_b["flight"].get("airline"),
-                        "departure": c_b["flight"].get("departure"),
-                        "arrival": c_b["flight"].get("arrival"),
-                        "duration": c_b["flight"].get("duration"),
-                        "buy_link": c_b["flight"].get("buy_link"),
-                    },
-                    {
-                        "origin": c_b["destination"],
-                        "destination": ret_dest,
-                        "date": res_ret["date"],
-                        "price": res_ret["price"],
-                        "stops": normalize_stops(res_ret["flight"].get("stops", 0)),
-                        "carrier": res_ret["flight"].get("airline"),
-                        "departure": res_ret["flight"].get("departure"),
-                        "arrival": res_ret["flight"].get("arrival"),
-                        "duration": res_ret["flight"].get("duration"),
-                        "buy_link": res_ret["flight"].get("buy_link"),
-                    }
-                ],
-                "cached": any([c_a.get("cached"), c_b.get("cached"), res_ret.get("cached")]),
-                "warning": warning_msg,
-            })
-        else:
-            stats["step3_missing_return"] += 1
+                    bridge_tasks.append(check_full_path())
+    
+    dlog(f"STAGE2_FIRE tasks={len(bridge_tasks)}")
+    raw_itineraries = await asyncio.gather(*bridge_tasks)
+    itineraries = [it for it in raw_itineraries if it is not None]
+
+    if dedupe_cities:
+        cheapest_pairs = {}
+        for it in itineraries:
+            pair = (it["legs"][0]["destination"], it["legs"][1]["destination"])
+            if pair not in cheapest_pairs or it["total_price"] < cheapest_pairs[pair]["total_price"]:
+                cheapest_pairs[pair] = it
+        itineraries = list(cheapest_pairs.values())
 
     itineraries.sort(key=lambda x: x["total_price"])
     top_itineraries = itineraries[:max_itineraries]
+    
     validated_itineraries = []
     for item in top_itineraries:
         try:
             itinerary_obj = ItineraryModel.model_validate(item)
             validated_itineraries.append(itinerary_obj.model_dump())
         except Exception as e:
-            print(f"Validation error for itinerary: {e}", file=sys.stderr)
+            dlog(f"VAL_ERR: {e}")
 
     stats["final_itineraries"] = len(validated_itineraries)
-    dlog(
-        "RUN_DONE "
-        f"itineraries={stats['final_itineraries']} missing_return={stats['step3_missing_return']} "
-        f"final_budget_pruned={stats['final_budget_pruned']}"
-    )
+    dlog(f"RUN_DONE_GRAPH itineraries={stats['final_itineraries']}")
+    
     result_payload = {"itineraries": validated_itineraries}
-    if debug:
-        result_payload["debug_stats"] = stats
+    if debug: result_payload["debug_stats"] = stats
     return result_payload
+
 
 
 async def fetch_route_options(

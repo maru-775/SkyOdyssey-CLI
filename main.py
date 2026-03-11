@@ -94,7 +94,7 @@ async def async_main():
     parser.add_argument("--max-stay2", type=int, help="Max stay days in city 2")
 
     parser.add_argument("--region", default="All", help="Region to search (default: All)")
-    parser.add_argument("--limit", type=int, default=3, help="Limit branching")
+    parser.add_argument("--limit", type=int, default=3, help="Controls search width and Hub discovery depth")
     parser.add_argument("--sort", choices=["price", "duration", "stops", "departure"], default="price", help="Sort key for basic mode")
     parser.add_argument("--depart-after", help="Filter flights departing after HH:MM (24h)")
     parser.add_argument("--depart-before", help="Filter flights departing before HH:MM (24h)")
@@ -103,7 +103,7 @@ async def async_main():
     parser.add_argument("--exclude-countries", nargs="+", help="Exclude countries")
     parser.add_argument("--exclude-airports", nargs="+", help="Exclude airports")
     parser.add_argument("--max-results", type=int, default=10, help="Number of itineraries to show")
-    parser.add_argument("--different-countries", action="store_true", help="Force different countries for City B")
+    parser.add_argument("--different-countries", action="store_true", help="Force international hops across all legs in odyssey mode")
     parser.add_argument("--direct", action="store_true", help="Only show direct flights (no layovers)")
     parser.add_argument("--return-origin", help="Return to a different airport (Open-Jaw)")
     parser.add_argument("--include-airlines", nargs="+", help="Only search these airlines")
@@ -111,9 +111,10 @@ async def async_main():
     parser.add_argument("--export", help="Export path (e.g. results.json or results.csv)")
     parser.add_argument("--max-budget", type=float, help="Maximum total price for the trip")
     parser.add_argument("--search-concurrency", type=int, help="Override async concurrency for odyssey searches")
-    parser.add_argument("--step1-multiplier", type=float, default=1.0, help="Step1 breadth multiplier for odyssey mode")
+    parser.add_argument("--step1-multiplier", type=float, default=1.0, help="Scales outbound Hub discovery width (default: 1.0)")
     parser.add_argument("--max-cityb-per-citya", type=int, default=8, help="Cap City B candidates per City A in odyssey mode")
     parser.add_argument("--early-return-buffer", type=float, default=25.0, help="Minimum remaining budget before checking return leg in odyssey mode")
+    parser.add_argument("--dedupe-cities", action="store_true", help="Only keep the cheapest itinerary for each unique city pair in odyssey mode")
     parser.add_argument("--deal-threshold", type=float, help="Highlight itineraries under this price")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logs")
     parser.add_argument("--debug-log", help="Optional path to write debug logs")
@@ -238,6 +239,7 @@ async def async_main():
                 early_return_buffer=args.early_return_buffer,
                 debug=args.debug,
                 debug_callback=debug_log,
+                dedupe_cities=args.dedupe_cities,
             )
 
     if args.debug_log and debug_lines:

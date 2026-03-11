@@ -7,7 +7,7 @@ It supports country/airport/airline filters, budget constraints, adaptive concur
 It now has two modes:
 
 - Basic mode (one-way / round-trip / anywhere)
-- Odyssey mode (advanced 3-leg loop optimizer) via `--odyssey`
+- Odyssey mode (advanced 3-leg loop optimizer) via `--odyssey` — **Now powered by a high-performance Graph-Based search engine.**
 
 ---
 
@@ -22,9 +22,13 @@ It now has two modes:
 - Country and airport exclusion filters
 - Airline include/exclude filters
 - `--different-countries` enforcement across legs
+- Comma-separated multi-region search (e.g. `--region "Europe,Africa,Asia"`)
+- City-based deduplication (`--dedupe-cities`) to keep only the cheapest itinerary per city pair
 - Budget-aware pruning (`--max-budget`)
 - Adaptive concurrency for better performance at higher `--limit`
 - In-flight request deduplication (avoids duplicate fetches during a run)
+- Graph-Based search algorithm in Odyssey mode for 10x speedup
+- Runtime `SWEEP_CACHE` for regional discovery results
 - SQLite cache (`flights_cache.db`) with TTL
 - Rich terminal output with:
   - Carrier
@@ -90,6 +94,7 @@ If you use `python main.py`, run the same flags after the script name.
   - Round-trip: add `--return-date`
 - **Odyssey mode**: add `--odyssey`
   - Advanced 3-leg itinerary optimization with stays and branching
+  - Uses a **Meet-in-the-Middle** approach: finds cheap outbound and inbound hubs first, then bridges them.
 
 ### Itinerary shape
 
@@ -101,7 +106,7 @@ SkyOdyssey searches for 3-leg loops:
 
 ### Branching (`--limit`)
 
-`--limit` controls search width at each stage:
+`--limit` controls search width and "Hub" discovery depth:
 
 - Higher value: broader search, better chance of finding strong routes, slower runtime
 - Lower value: faster search, but may miss good combinations
@@ -137,7 +142,7 @@ If your budget is tight, getting no results is expected even when valid flights 
 --min-stay2            Min stay in City B (default: 2)
 --max-stay2            Max stay in City B
 
---region               Search region (default: All)
+--region               Search region(s). Supports comma-separated list (default: All)
 --limit                Branching limit per leg (default: 3)
 --sort                 Basic mode sorting: price|duration|stops|departure
 --depart-after         HH:MM 24h time filter (basic modes)
@@ -159,6 +164,7 @@ If your budget is tight, getting no results is expected even when valid flights 
 --step1-multiplier     Step 1 breadth multiplier (City A sweep)
 --max-cityb-per-citya  Cap City B branches per City A
 --early-return-buffer  Min remaining budget required before checking return leg
+--dedupe-cities        Only keep the cheapest itinerary for each unique city pair
 --deal-threshold       Highlight deals under threshold
 
 --export               Output file (.json or .csv)
@@ -237,13 +243,13 @@ skyodyssey --origin LYS --date 2026-04-19 --export results.json
 skyodyssey --origin LYS --date 2026-04-19 --export results.csv
 ```
 
-### 8) High-performance odyssey tuning
-
-```bash
-skyodyssey --origin LYS --date 2026-04-19 --odyssey --stay1 3 --stay2 2 --max-budget 150 --different-countries --region All --limit 50 --max-results 30 --search-concurrency 10 --max-cityb-per-citya 6 --early-return-buffer 20
-```
-
----
+### 8) High-performance odyssey tuning with multi-region and dedupe
+ 
+ ```bash
+ python main.py --origin LYS --date 2026-04-19 --odyssey --stay1 3 --stay2 3 --max-budget 150 --different-countries --region "Europe,Morocco,Tunisia" --limit 50 --max-results 30 --dedupe-cities --search-concurrency 15
+ ```
+ 
+ ---
 
 ## Output Format
 
@@ -267,13 +273,12 @@ Each result row contains:
 
 For faster results at larger search widths:
 
-1. Start with moderate `--limit` (`3-8`), then increase
+1. Start with moderate `--limit` (`30-50`)
 2. Use `--max-budget` and `--early-return-buffer` to prune expensive branches early
-3. Use `--search-concurrency` (`6-10` usually good) to reduce wall-clock time
-4. Keep `--max-cityb-per-citya` moderate (`4-10`) to avoid Step 3 explosion
-5. Use `--step1-multiplier` (`1.0-1.5`) if you want wider first-leg exploration
-6. Use `--direct` if your use case allows
-7. Warm cache with a smaller run, then run broader search
+3. Use `--search-concurrency` (`10-20` depending on connection) to reduce wall-clock time
+4. Use `--different-countries` to filter out domestic flights
+5. Use `--direct` if your use case allows
+6. Higher `--limit` results in deeper hub discovery and more "bridge" verification
 8. Use `--debug` to inspect where pruning is happening
 
 Meaning of the new odyssey tuning flags:

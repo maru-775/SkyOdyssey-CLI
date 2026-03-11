@@ -1,3 +1,5 @@
+import sys
+
 AIRPORTS_BY_REGION = {
     "Europe": [
         # France
@@ -17,7 +19,8 @@ AIRPORTS_BY_REGION = {
         # Eastern Europe & Balkans
         "WAW", "KRK", "GDN", "PRG", "BUD", "OTP", "SOF", "BEG", "SKP", "TIA", "MSQ", "KBP",
         # Southeast
-        "ATH", "SKG", "HER", "IST", "SAW"
+        "ATH", "SKG", "HER", "CFU", "RHO", "CHQ", "ZTH", "KGS", "JTR", "JMK", # Greece
+        "IST", "SAW", "ESB", "AYT", "ADB", "DLM", "BJV" # Turkey
     ],
     "North America": [
         "ATL", "LAX", "ORD", "DFW", "DEN", "JFK", "SFO", "SEA", "LAS", "MCO",
@@ -32,7 +35,8 @@ AIRPORTS_BY_REGION = {
         "PKX", "CAN", "SZX", "CTU", "KMG", "SHA", # China
         "KIX", "CTS", "FUK", # Japan
         "BLR", "HYD", "MAA", "CCU", # India
-        "RUH", "JED", "KWI", "MCT" # Middle East
+        "RUH", "JED", "KWI", "MCT", # Middle East
+        "AMM", "BEY", "TLV" # Levant
     ],
     "Africa": [
         # North Africa & Morocco
@@ -50,7 +54,10 @@ AIRPORTS_BY_REGION = {
     ],
     "South America": [
         "GRU", "BOG", "SCL", "LIM", "EZE", "GIG", "AEP", "VVI", "UIO", "ASU", "MVD", "MDE"
-    ]
+    ],
+    # Idk i really wanted to travel to Morocco and Tunisia
+    "Morocco": ["CMN", "RAK", "AGA", "TNG", "FEZ", "RBA", "NDR", "OUD"],
+    "Tunisia": ["TUN", "DJE", "MIR", "SFA"]
 }
 
 AIRPORT_TO_COUNTRY = {
@@ -73,7 +80,8 @@ AIRPORT_TO_COUNTRY = {
     # Eastern Europe & Balkans
     "WAW": "Poland", "KRK": "Poland", "GDN": "Poland", "PRG": "Czechia", "BUD": "Hungary", "OTP": "Romania", "SOF": "Bulgaria", "BEG": "Serbia", "SKP": "North Macedonia", "TIA": "Albania", "MSQ": "Belarus", "KBP": "Ukraine",
     # Southeast
-    "ATH": "Greece", "SKG": "Greece", "HER": "Greece", "IST": "Turkey", "SAW": "Turkey",
+    "ATH": "Greece", "SKG": "Greece", "HER": "Greece", "CFU": "Greece", "RHO": "Greece", "CHQ": "Greece", "ZTH": "Greece", "KGS": "Greece", "JTR": "Greece", "JMK": "Greece",
+    "IST": "Turkey", "SAW": "Turkey", "ESB": "Turkey", "AYT": "Turkey", "ADB": "Turkey", "DLM": "Turkey", "BJV": "Turkey",
 
     # North America - USA
     "ATL": "USA", "LAX": "USA", "ORD": "USA", "DFW": "USA", "DEN": "USA", "JFK": "USA", "SFO": "USA", "SEA": "USA", "LAS": "USA", "MCO": "USA", "EWR": "USA", "CLT": "USA", "PHX": "USA", "IAH": "USA", "MIA": "USA", "BOS": "USA", "IAD": "USA", "DCA": "USA", "SAN": "USA", "TPA": "USA", "PHL": "USA", "MSP": "USA", "DTW": "USA", "SLC": "USA", "FLL": "USA", "BWI": "USA", "MDW": "USA",
@@ -90,6 +98,7 @@ AIRPORT_TO_COUNTRY = {
     "DXB": "UAE", "DOH": "Qatar", "AUH": "UAE", "SGN": "Vietnam", "HAN": "Vietnam", "MNL": "Philippines", "CGK": "Indonesia",
     "PKX": "China", "CAN": "China", "SZX": "China", "CTU": "China", "KMG": "China", "SHA": "China",
     "RUH": "Saudi Arabia", "JED": "Saudi Arabia", "KWI": "Kuwait", "MCT": "Oman",
+    "AMM": "Jordan", "BEY": "Lebanon", "TLV": "Israel",
 
     # Africa
     # Morocco
@@ -133,28 +142,39 @@ CITY_HUBS = {
 AIRPORT_TO_HUB = {code: hub for hub, codes in CITY_HUBS.items() for code in codes}
 
 def get_airports_for_region(region: str):
-    """Returns all airport codes for a specific region.
+    """Returns all airport codes for a specific region or a comma-separated list of regions.
 
     Behaviour notes:
     - Region matching is case-insensitive (e.g. 'all', 'All', 'ALL').
     - When returning all regions, preserves original ordering and removes duplicates.
+    - Supports multiple regions separated by commas (e.g. 'Europe,Africa').
     """
     if not region:
         return []
 
-    region_normalized = region.strip().lower()
-    if region_normalized == "all":
+    # Handle multiple regions
+    requested_regions = [r.strip().lower() for r in region.split(",")]
+    
+    if "all" in requested_regions:
         all_airports = []
         for airports in AIRPORTS_BY_REGION.values():
             all_airports.extend(airports)
         # Preserve order while removing duplicates
         return list(dict.fromkeys(all_airports))
 
-    for region_name, airports in AIRPORTS_BY_REGION.items():
-        if region_name.lower() == region_normalized:
-            return airports
+    combined_airports = []
+    for req_region in requested_regions:
+        found = False
+        for region_name, airports in AIRPORTS_BY_REGION.items():
+            if region_name.lower() == req_region:
+                combined_airports.extend(airports)
+                found = True
+                break
+        if not found:
+            print(f"Warning: Region '{req_region}' not found.", file=sys.stderr)
 
-    return []
+    # Remove duplicates while preserving order
+    return list(dict.fromkeys(combined_airports))
 
 def get_airports_excluding(region: str, excluded_countries: list = None, excluded_airports: list = None):
     """Returns airports in a region excluding specific countries or airport codes."""

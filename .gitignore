@@ -35,3 +35,4 @@ flights_cache.db-wal
 # Local run outputs
 debug_run.log
 basic_results.csv
+final_itineraries.json
